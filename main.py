@@ -29,6 +29,9 @@ def init_data_start(target_id: str, train, target):
         random_state=42
     )
 
+    X_train = X_train.reset_index(drop=True)
+    X_valid = X_valid.reset_index(drop=True)
+
     # Этап 4: выбираем cat_feature с ними работает catboost
     cat_feature_names = [col for col in X_train.columns if col.startswith("cat_feature")]
     X_train[cat_feature_names] = X_train[cat_feature_names].astype(str)
@@ -48,8 +51,8 @@ def objective(trial: optuna.Trial, train: Pool, valid: Pool):
         'use_best_model': True,
         'early_stopping_rounds': 50, # если метрика не растёт 50 деревьев, пруним
         'task_type': 'GPU',
-        'thread_count': -1,  # кол-во используемых потоков(-1 макс)
-        'iterations': 1_200, # специально много, потому что ставка не на это
+        'thread_count': 20,  # кол-во используемых потоков(-1 макс)
+        'iterations': 10_000, # специально много, потому что ставка не на это
         'depth': trial.suggest_int('depth', 4, 7),
         'learning_rate': trial.suggest_float('learning_rate', .01, .3, log=True),
         'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1., 50., log=True),
@@ -90,7 +93,7 @@ def get_bst_par(train: Pool, valid: Pool):
     )
     study.optimize(
         lambda trial: objective(trial, train, valid),
-        n_trials=6,    # ограничение в 30попыток поиска параметров
+        n_trials=30,    # ограничение в 30попыток поиска параметров
         gc_after_trial=True,
     )
     
@@ -100,6 +103,7 @@ def get_bst_par(train: Pool, valid: Pool):
 def get_bst_features(best_params, train: Pool, valid: Pool):
     model = CatBoostClassifier(
         **best_params,
+        task_type='GPU',
         verbose=False
     )
     model.fit(train, eval_set=valid)
@@ -118,13 +122,14 @@ def oof_one_target(best_features, best_params, X_train, y_train):
     X_train = X_train[best_features]
     category = [col for col in X_train.columns if col.startswith('cat_feature')]
 
-    kf = StratifiedKFold(n_splits=5, shuffle=True)
+    kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
     # samples * 1 <- вектор предсказаний для каждой строчки (1, потому что мы обучаем тут одну определенную модель)
     # потом простэкуем их все и получим samples * 41, что и будет являться обучащими данными для второй модели
     preds_model = np.zeros(len(X_train))
 
     for train_idx, valid_idx in kf.split(X_train, y_train):
+
         X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[valid_idx]
         y_tr, y_val = y_train[train_idx], y_train[valid_idx]
 
@@ -133,6 +138,7 @@ def oof_one_target(best_features, best_params, X_train, y_train):
 
         model = CatBoostClassifier(
             **best_params,
+            task_type='GPU',
             verbose=False
         )
         model.fit(train_fold, eval_set=valid_fold)
@@ -148,6 +154,7 @@ def save_snapshot(best_params, best_features, target_idx, X_train, y_train, cate
     X_train = X_train[best_features]
     model = CatBoostClassifier(
         **best_params,
+        task_type='GPU',
         verbose=False
     )
     
@@ -157,7 +164,7 @@ def save_snapshot(best_params, best_features, target_idx, X_train, y_train, cate
     Path('snapshots').mkdir(exist_ok=True)
     Path('configs').mkdir(exist_ok=True)
 
-    model.save_model(f'shapshots/{target_idx}.cbm')
+    model.save_model(f'snapshots/{target_idx}.cbm')
 
     data = {
         'target': target_idx,
@@ -183,47 +190,58 @@ def save_oof_column(target_idx: str, preds: np.ndarray, filepath: str = 'meta_da
     print(f"✅ Сохранён столбец '{target_idx}' в {filepath}")
 
 
-def main():
-    # Грузим данные
-    train = pl.read_parquet(train_path).drop('customer_id')
-    target = pl.read_parquet(target_path).drop('customer_id')
-    columns_tar = target.columns
 
-    oof_predictions = {} # словарь для предсказаний
-    idx_col = [0, 1] # таргеты которые хочешь обработать за сессию
+train = pl.read_parquet(train_path).drop('customer_id')
+target = pl.read_parquet(target_path).drop('customer_id')
+columns_tar = target.columns
 
-    for i in range(idx_col[0], idx_col[1]):
-        target_idx = columns_tar[i]
-        print(f"TARGET: {target_idx}")
-        time_target = time.time()
-        # Этап 1: получаем data
-        train_pool, valid_pool, X_train, y_train = init_data_start(target_idx, train, target)
-
-        # Этап 2: получаем лучшие гиперпараметры таргета
-        best_params = get_bst_par(train_pool, valid_pool)
-
-        # Этап 3: получаем лучшие фичи в датасете для таргета
-        best_features = get_bst_features(best_params, train_pool, valid_pool)
-
-        # Этап 4: получаем столбец предсказаний по target_id
-        preds_target, category = oof_one_target(best_features, best_params, X_train, y_train)
-
-        # Этап 5: добавляем результат предсказания по таргету в общий список
-        oof_predictions[target_idx] = preds_target
-
-        #Этап 6: сохраняем данные о модели
-        save_snapshot(best_params, best_features, target_idx, X_train, y_train, category)
-        
-        # Этап 7: сохраняем preds_target для каждого таргета
-        save_oof_column(target_idx, preds_target, 'meta_data.parquet')
-
-        time_target = time.time() - time_target
-        print(f'Work time: {time_target}\n')
-
-    meta_df = pl.DataFrame(oof_predictions)
-    meta_df.write_parquet('meta_data.parquet')
-    print(f"Итоговая таблица: {meta_df.shape}")
+oof_predictions = {} # словарь для предсказаний
+idx_col = [0, 1] # таргеты которые хочешь обработать за сессию
 
 
-if __name__ == "__main__":
-    main()
+time_all = time.time()
+for i in range(idx_col[0], idx_col[1]):
+    target_idx = columns_tar[i]
+
+    print(f"TARGET: {target_idx}")
+    time_target = time.time()
+
+    print('Этап 1: получаем data')
+    time_stage = time.time()
+    train_pool, valid_pool, X_train, y_train = init_data_start(target_idx, train, target)
+    print(f'Этап 1 выполнен за {time.time() - time_stage:.3f} сек')
+
+    print('Этап 2: получаем лучшие гиперпараметры таргета')
+    time_stage = time.time()
+    best_params = get_bst_par(train_pool, valid_pool)
+    print(f'Этап 2 выполнен за {time.time() - time_stage:.3f} сек')
+
+    print('Этап 3: получаем лучшие фичи в датасете для таргета')
+    time_stage = time.time()
+    best_features = get_bst_features(best_params, train_pool, valid_pool)
+    print(f'Этап 3 выполнен за {time.time() - time_stage:.3f} сек')
+
+    print('Этап 4: получаем столбец предсказаний по target_id')
+    time_stage = time.time()
+    preds_target, category = oof_one_target(best_features, best_params, X_train, y_train)
+    print(f'Этап 4 выполнен за {time.time() - time_stage:.3f} сек')
+
+    print('Этап 5: добавляем результат предсказания по таргету в общий список')
+    time_stage = time.time()
+    oof_predictions[target_idx] = preds_target
+    print(f'Этап 5 выполнен за {time.time() - time_stage:.3f} сек')
+
+    print('Этап 6: сохраняем данные о модели')
+    time_stage = time.time()
+    save_snapshot(best_params, best_features, target_idx, X_train, y_train, category)
+    print(f'Этап 6 выполнен за {time.time() - time_stage:.3f} сек')
+
+    print('Этап 7: сохраняем preds_target для каждого таргета')
+    time_stage = time.time()
+    save_oof_column(target_idx, preds_target, 'meta_data.parquet')
+    print(f'Этап 7 выполнен за {time.time() - time_stage:.3f} сек')
+
+    time_target = time.time() - time_target
+    print(f'Время для {target_idx}: {time_target} сек\n')
+
+print(f'Обучение {idx_col[1] - idx_col[0] + 1} целевых: {time.time() - time_all} сек')
