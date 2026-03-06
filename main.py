@@ -1,4 +1,4 @@
-import gc
+import gc, os
 import json
 import time
 import optuna
@@ -17,23 +17,17 @@ import matplotlib.pyplot as plt
 train_path = 'data/train/train_main_features.parquet'
 target_path = 'data/train/train_target.parquet'
 
-def init_data_start(target_id: str):
+def init_data_start(target_id: str, train, target):
     # Этап 1: загрузка данных
-    train = pl.read_parquet(train_path).drop('customer_id')
-    target = pl.read_parquet(target_path).drop('customer_id')
-    target = target.select(target_id).to_series()
+    target_by_id = target.select(target_id).to_series()
 
     # Этап 2: разделяем на valid/train
     X_train, X_valid, y_train, y_valid = train_test_split(
         train.to_pandas(),
-        target.to_numpy(), 
+        target_by_id.to_numpy(), 
         test_size=0.2, 
         random_state=42
     )
-
-    # Этап 3: очищаем чтобы не кончилась память
-    del train, target
-    gc.collect()
 
     # Этап 4: выбираем cat_feature с ними работает catboost
     cat_feature_names = [col for col in X_train.columns if col.startswith("cat_feature")]
@@ -115,7 +109,7 @@ def get_bst_features(best_params, train: Pool, valid: Pool):
 
     # НУЖНО ОПРЕДЕЛИТЬ ОПТИМАЛЬНОЕ КОЛ-ВО ВАЖНЫХ ПРИЗНАКОВ
     N = 150
-    best_features = feature_importance['FeatureId'].head(N).tolist()
+    best_features = feature_importance.iloc[:, 0].head(N).tolist()
 
     return best_features
 
@@ -176,13 +170,24 @@ def save_snapshot(best_params, best_features, target_idx, X_train, y_train, cate
         json.dump(data, file, indent=4)
 
 
+def save_oof_column(target_idx: str, preds: np.ndarray, filepath: str = 'meta_data.parquet'):
+    if os.path.exists(filepath):
+        # Читаем существующий файл и добавляем колонку
+        meta_df = pl.read_parquet(filepath)
+        meta_df = meta_df.with_columns(pl.Series(target_idx, preds))
+    else:
+        # Создаём новый DataFrame с первой колонкой
+        meta_df = pl.DataFrame({target_idx: preds})
+    
+    meta_df.write_parquet(filepath)
+    print(f"✅ Сохранён столбец '{target_idx}' в {filepath}")
+
+
 def main():
+    # Грузим данные
+    train = pl.read_parquet(train_path).drop('customer_id')
     target = pl.read_parquet(target_path).drop('customer_id')
     columns_tar = target.columns
-    
-    # очищаем память
-    del target
-    gc.collect()
 
     oof_predictions = {} # словарь для предсказаний
     idx_col = [0, 1] # таргеты которые хочешь обработать за сессию
@@ -192,7 +197,7 @@ def main():
         print(f"TARGET: {target_idx}")
         time_target = time.time()
         # Этап 1: получаем data
-        train_pool, valid_pool, X_train, y_train = init_data_start(target_idx)
+        train_pool, valid_pool, X_train, y_train = init_data_start(target_idx, train, target)
 
         # Этап 2: получаем лучшие гиперпараметры таргета
         best_params = get_bst_par(train_pool, valid_pool)
@@ -209,6 +214,9 @@ def main():
         #Этап 6: сохраняем данные о модели
         save_snapshot(best_params, best_features, target_idx, X_train, y_train, category)
         
+        # Этап 7: сохраняем preds_target для каждого таргета
+        save_oof_column(target_idx, preds_target, 'meta_data.parquet')
+
         time_target = time.time() - time_target
         print(f'Work time: {time_target}\n')
 
