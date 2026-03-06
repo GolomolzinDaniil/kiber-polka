@@ -90,7 +90,7 @@ def get_bst_par(train: Pool, valid: Pool):
     )
     study.optimize(
         lambda trial: objective(trial, train, valid),
-        n_trials=30,    # ограничение в 30попыток поиска параметров
+        n_trials=6,    # ограничение в 30попыток поиска параметров
         gc_after_trial=True,
     )
     
@@ -135,7 +135,7 @@ def oof_one_target(best_features, best_params, X_train, y_train):
             **best_params,
             verbose=False
         )
-        model.fit(train_fold, valid_fold)
+        model.fit(train_fold, eval_set=valid_fold)
         preds_model[valid_idx] = model.predict_proba(valid_fold)[:,1]
 
         del model, train_fold, valid_fold
