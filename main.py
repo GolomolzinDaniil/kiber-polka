@@ -82,13 +82,13 @@ def get_bst_par(train: Pool, valid: Pool):
         direction='maximize',
         sampler=optuna.samplers.TPESampler(seed=42),
         pruner=optuna.pruners.MedianPruner(
-            n_startup_trials=1, # кол-во честных попыток (без прунинга)
+            n_startup_trials=5, # кол-во честных попыток (без прунинга)
             n_warmup_steps=20
         )
     )
     study.optimize(
         lambda trial: objective(trial, train, valid),
-        n_trials=1,    # ограничение в 30попыток поиска параметров
+        n_trials=30,    # ограничение в 30попыток поиска параметров
         gc_after_trial=True,
     )
     
@@ -133,7 +133,7 @@ def oof_one_target(best_features, best_params, X_train, y_train):
     X_train = X_train.select(best_features)
     category = [col for col in X_train.columns if col.startswith('cat_feature')]
 
-    kf = StratifiedKFold(n_splits=2, shuffle=True, random_state=42)
+    kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     preds_model = np.zeros(len(X_train))
 
     for train_idx, valid_idx in kf.split(X_train, y_train):
