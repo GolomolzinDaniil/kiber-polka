@@ -8,7 +8,7 @@ import pyarrow
 import matplotlib.pyplot as plt
 import polars as pl
 import pandas as pd
-import numpy as np
+import numpy  as np
 import optuna
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from catboost import CatBoostClassifier, Pool
@@ -45,17 +45,15 @@ def init_data_start(target_id: str, train, target):
 def objective(trial: optuna.Trial, train: Pool, valid: Pool):
     params = {
         'eval_metric': 'AUC',
-        'verbose': 50, # отчёт каждые N новых деревьев
+        'verbose': 0, # отчёт каждые N новых деревьев
         'use_best_model': True,
         'early_stopping_rounds': 50, # если метрика не растёт 50 деревьев, пруним
         'task_type': 'GPU',
         'thread_count': 20,  # кол-во используемых потоков(-1 макс)
-        'iterations': 10_000, # специально много, потому что ставка не на это
+        'iterations': 6_000, # специально много, потому что ставка не на это
         'depth': trial.suggest_int('depth', 4, 7),
         'learning_rate': trial.suggest_float('learning_rate', .01, .3, log=True),
         'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1., 50., log=True),
-        #'subsample': trial.suggest_float('subsample', .5, 1.),
-        #'colsample_bylevel': trial.suggest_float('colsample_bylevel', .5, 1.),
         'min_data_in_leaf': trial.suggest_int('min_data_in_leaf', 1, 50),
         'random_strength': trial.suggest_int('random_strength', 1, 7),
     }
@@ -158,7 +156,7 @@ def oof_one_target(best_features, best_params, X_train, y_train):
     return preds_model, category 
 
 
-def save_snapshot(best_params, best_features, target_idx, X_train, y_train, category):
+def save_snapshot(best_params, best_features, target_idx, X_train, y_train, category, oof_score):
     X_train = X_train[best_features]
     model = CatBoostClassifier(
         **best_params,
@@ -176,7 +174,7 @@ def save_snapshot(best_params, best_features, target_idx, X_train, y_train, cate
 
     data = {
         'target': target_idx,
-        'best_score': model.get_best_score()['learn'],
+        'best_score': oof_score,
         'best_params': best_params,
         'best_features': best_features,
         'category': category,
@@ -206,7 +204,7 @@ def main():
     target = pl.read_parquet(target_path).drop('customer_id')
     columns_tar = target.columns
 
-    idx_col = [1, 2] # таргеты которые хочешь обработать за сессию
+    idx_col = [0, 10] # таргеты которые хочешь обработать за сессию
 
     time_all = time.time()
     for i in range(idx_col[0], idx_col[1]):
@@ -236,8 +234,10 @@ def main():
         print(f'Этап 4 выполнен за {(time.time() - time_stage) / 60:.2f} мин.')
 
         print('Этап 5: сохраняем данные о модели')
+        from sklearn.metrics import roc_auc_score
+        oof_auc = roc_auc_score(y_train, preds_target)
         time_stage = time.time()
-        save_snapshot(best_params, best_features, target_idx, X_train, y_train, category)
+        save_snapshot(best_params, best_features, target_idx, X_train, y_train, category, oof_auc)
         print(f'Этап 5 выполнен за {(time.time() - time_stage) / 60:.2f} мин.')
 
         print('Этап 6: сохраняем preds_target для каждого таргета')
