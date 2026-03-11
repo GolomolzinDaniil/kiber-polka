@@ -1,4 +1,8 @@
-.venv
-data
-catboost_info
 .vscode
+.venv
+
+data
+configs
+snapshots
+trash
+catboost_info
