@@ -204,7 +204,7 @@ def main():
     target = pl.read_parquet(target_path).drop('customer_id')
     columns_tar = target.columns
 
-    idx_col = [0, 10] # таргеты которые хочешь обработать за сессию
+    idx_col = [20, 30] # таргеты которые хочешь обработать за сессию
 
     time_all = time.time()
     for i in range(idx_col[0], idx_col[1]):
