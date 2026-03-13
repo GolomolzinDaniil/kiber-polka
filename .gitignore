@@ -3,6 +3,6 @@
 
 data
 configs
-snapshots
+# snapshots
 trash
 catboost_info
