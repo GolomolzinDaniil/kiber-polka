@@ -2,7 +2,5 @@
 .venv
 
 data
-configs
-# snapshots
 trash
 catboost_info
