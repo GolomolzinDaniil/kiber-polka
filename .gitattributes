@@ -1,0 +1,2 @@
+meta_data.parquet filter=lfs diff=lfs merge=lfs -text
+snapshots/*.cbm filter=lfs diff=lfs merge=lfs -text
