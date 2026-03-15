@@ -4,8 +4,6 @@ import time
 from pathlib import Path
 from typing import List, Tuple, Dict
 
-import pyarrow
-import matplotlib.pyplot as plt
 import polars as pl
 import pandas as pd
 import numpy as np
@@ -106,47 +104,63 @@ def init_data_start(target_id: str, train, target):
         stratify=target_by_id
     )
 
-    # Этап 3: возьмем по деланным индексам данные
-    X_train = train.iloc[train_idx]  # ✅ Уже pandas DataFrame
+    train_pd = train.to_pandas()
+    
+    X_train = train_pd.iloc[train_idx]  # ✅ pandas .iloc работает с индексами
     y_train = target_by_id[train_idx]
-    X_valid = train.iloc[valid_idx]  # ✅ Уже pandas DataFrame
+    X_valid = train_pd.iloc[valid_idx]
     y_valid = target_by_id[valid_idx]
 
     return X_train, y_train, X_valid, y_valid
 
-
 def objective(trial: optuna.Trial, X_train, y_train, X_valid, y_valid):
     """Функция для оптимизации гиперпараметров"""
+    
+    # ✅ Объединяем train + valid для использования validation_fraction
+    X_combined = pd.concat([X_train, X_valid], axis=0, ignore_index=True)
+    y_combined = np.concatenate([y_train, y_valid])
+    
     params = {
         'verbose': 0,
         'early_stopping': True,
         'n_iter_no_change': 50,
+        'validation_fraction': 0.2,
         'max_iter': 6000,
         'max_depth': trial.suggest_int('max_depth', 4, 12),
         'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
-        'l2_regularization': trial.suggest_float('l2_regularization', 0.0, 10.0, log=True),
+        'l2_regularization': trial.suggest_float('l2_regularization', 0.001, 10.0, log=True),
         'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 50),
         'max_bins': trial.suggest_int('max_bins', 32, 255),
-        'categorical_features': None,
+        'scoring': 'roc_auc',
     }
 
     model = HistGradientBoostingClassifier(**params)
-    model.fit(X_train, y_train, eval_set=[X_valid], sample_weight=None)
+    model.fit(X_combined, y_combined)
 
-    # ✅ Получение лучшей метрики
-    best_score = model.best_score_['validation']['roc_auc']
+    # ✅ ПРАВИЛЬНО: Получение лучшей метрики (совместимо со всеми версиями sklearn)
+    try:
+        # sklearn >= 1.3.0
+        if hasattr(model, 'validation_history_') and len(model.validation_history_) > 0:
+            best_score = max(score.roc_auc for score in model.validation_history_)
+        else:
+            # sklearn < 1.3.0 или validation_history_ пуст
+            best_score = model.validation_score_
+    except AttributeError:
+        # Fallback: считаем метрику вручную
+        best_score = roc_auc_score(y_combined, model.predict_proba(X_combined)[:, 1])
 
-    # ✅ ДЛЯ ПРУНИНГА
-    scores = model.validation_history_
-    for epoch, score in enumerate(scores, 1):
-        trial.report(score.roc_auc, epoch)
-
-        if trial.should_prune():
-            raise optuna.TrialPruned()
+    # ✅ ДЛЯ ПРУНИНГА (совместимо со всеми версиями)
+    try:
+        if hasattr(model, 'validation_history_'):
+            for epoch, score in enumerate(model.validation_history_, 1):
+                trial.report(score.roc_auc, epoch)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
+    except AttributeError:
+        # Если validation_history_ недоступен, пропускаем прунинг
+        pass
     
-    # ✅ ДЛЯ OPTUNA
     return best_score
-
 
 def get_bst_par(X_train, y_train, X_valid, y_valid):
     """Поиск лучших гиперпараметров"""
@@ -175,15 +189,19 @@ def get_bst_features(
         coverage: float = 0.95
     ):
     """Отбор лучших признаков по важности"""
+    
+    # ✅ Объединяем данные для обучения
+    X_combined = pd.concat([X_train, X_valid], axis=0, ignore_index=True)
+    y_combined = np.concatenate([y_train, y_valid])
+    
     model = HistGradientBoostingClassifier(
         **best_params,
         verbose=False
     )
-    model.fit(X_train, y_train, eval_set=[X_valid])
+    model.fit(X_combined, y_combined)
 
-    # ✅ Получение важности признаков
     feature_importance = pd.DataFrame({
-        'Feature Id': X_train.columns,
+        'Feature Id': X_combined.columns,
         'Importances': model.feature_importances_
     })
 
@@ -202,10 +220,9 @@ def get_bst_features(
 
     return best_features
 
-
 def oof_one_target(best_features, best_params, X_train, y_train):
     """Генерация OOF предсказаний через кросс-валидацию"""
-    X_train = X_train[best_features]  # ✅ Отбор признаков
+    X_train = X_train[best_features]
     
     kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     preds_model = np.zeros(len(X_train))
@@ -218,7 +235,7 @@ def oof_one_target(best_features, best_params, X_train, y_train):
             **best_params,
             verbose=False
         )
-        model.fit(X_tr, y_tr, eval_set=[X_val])
+        model.fit(X_tr, y_tr)  # ✅ Нет eval_set!
         preds_model[valid_idx] = model.predict_proba(X_val)[:, 1]
 
         del model, X_tr, X_val
@@ -229,18 +246,19 @@ def oof_one_target(best_features, best_params, X_train, y_train):
 
 def save_snapshot(best_params, best_features, target_idx, X_train, y_train, oof_score):
     """Сохранение модели и конфига"""
-    X_train = X_train[best_features]
+    
+    X_combined = X_train[best_features]
+    
     model = HistGradientBoostingClassifier(
         **best_params,
         verbose=False
     )
-    
-    model.fit(X_train, y_train)
+    model.fit(X_combined, y_train)
 
     Path('snapshots2').mkdir(exist_ok=True)
     Path('configs2').mkdir(exist_ok=True)
 
-    # ✅ Сохранение через joblib
+    import joblib
     joblib.dump(model, f'snapshots2/{target_idx}.pkl')
 
     data = {
